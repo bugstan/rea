@@ -1,4 +1,5 @@
 import type { FileHandle } from "node:fs/promises";
+import { RegularFileOperationCancelled } from "../filesystem/RegularFile.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import {
   withOwnedFileHandle,
@@ -6,10 +7,13 @@ import {
   RegularFileCancelled,
   RegularFileCleanupFailure,
 } from "../filesystem/OwnedRegularFile.js";
-import { ArtifactReaderFailure } from "./ArtifactReader.js";
 import {
-  ArtifactResourceRetryFailure,
-  type ArtifactResourceScope,
+  ArtifactReaderFailure,
+  artifactPrimaryCleanupLeases,
+} from "./ArtifactReader.js";
+import type {
+  ArtifactResourceOwner,
+  ArtifactResourceScope,
 } from "./ArtifactResourceScope.js";
 import {
   AnalysisCleanupLease,
@@ -21,12 +25,26 @@ import type { AnalysisError } from "../domain/analysisErrorBase.js";
 export class ArtifactFileCleanupFailure<
   Value = unknown,
 > extends ArtifactReaderFailure {
-  readonly cleanupLeases: readonly AnalysisCleanupLease[] | undefined;
+  override readonly cleanupLeases: readonly AnalysisCleanupLease[] | undefined;
+  readonly fileCleanupFailure: RegularFileCleanupFailure<Value>;
   constructor(
-    readonly fileCleanupFailure: RegularFileCleanupFailure<Value>,
+    fileCleanupFailure: RegularFileCleanupFailure<Value>,
     readonly cleanupLease: AnalysisCleanupLease,
-    readonly completionCancellation?: { readonly reason: unknown },
   ) {
+    const outcome = fileCleanupFailure.outcome;
+    if (
+      outcome.kind === "failed" &&
+      outcome.cause instanceof RegularFileOperationCancelled
+    )
+      fileCleanupFailure = new RegularFileCleanupFailure(
+        fileCleanupFailure.path,
+        fileCleanupFailure.owner,
+        { kind: "failed", cause: artifactOperationCause(outcome.cause) },
+        fileCleanupFailure.cleanupCause,
+        fileCleanupFailure.retention,
+        fileCleanupFailure.completionCancellation,
+      );
+    const completionCancellation = fileCleanupFailure.completionCancellation;
     const primary =
       fileCleanupFailure.outcome.kind === "failed"
         ? fileCleanupFailure.outcome.cause
@@ -60,20 +78,43 @@ export class ArtifactFileCleanupFailure<
       },
       projected.details,
     );
+    this.fileCleanupFailure = fileCleanupFailure;
     const inherited =
-      primary instanceof ArtifactFileCleanupFailure ||
-      primary instanceof ArtifactResourceRetryFailure
-        ? primary.cleanupLeases
-        : primary instanceof ArtifactReaderFailure &&
-            primary.cleanup !== undefined
-          ? undefined
-          : [];
+      fileCleanupFailure.outcome.kind === "failed"
+        ? artifactPrimaryCleanupLeases(fileCleanupFailure.outcome.cause)
+        : [];
     this.cleanupLeases =
       inherited === undefined
         ? undefined
         : [...new Set([cleanupLease, ...inherited])];
   }
 }
+
+/** Errnos raised while the caller-selected artifact path is being resolved. */
+export type ArtifactSelectedPathErrno =
+  | "ENOENT"
+  | "ENOTDIR"
+  | "ELOOP"
+  | "ENAMETOOLONG";
+
+/** Return only known path-resolution errnos; permissions and I/O remain distinct. */
+export const artifactSelectedPathErrno = (
+  cause: unknown,
+): ArtifactSelectedPathErrno | undefined => {
+  if (!(cause instanceof Error) || !("code" in cause)) return undefined;
+  switch (String(cause.code)) {
+    case "ENOENT":
+      return "ENOENT";
+    case "ENOTDIR":
+      return "ENOTDIR";
+    case "ELOOP":
+      return "ELOOP";
+    case "ENAMETOOLONG":
+      return "ENAMETOOLONG";
+    default:
+      return undefined;
+  }
+};
 
 /** Normalize the physical primary failure without replacing its exact cleanup owner. */
 export const mapArtifactFileFailure = (
@@ -95,9 +136,9 @@ export const mapArtifactFileFailure = (
       { kind: "failed", cause: primary },
       physical.cleanupCause,
       physical.retention,
+      physical.completionCancellation,
     ),
     cause.cleanupLease,
-    cause.completionCancellation,
   );
 };
 
@@ -127,17 +168,39 @@ export class ArtifactFileCancelled<
   }
 }
 
+/** Completion facts recorded by the file owner, independent of later caller state. */
+export const artifactFileCompletion = (
+  cause: unknown,
+):
+  | {
+      readonly kind: "completed";
+      readonly value: unknown;
+      readonly cancellation: { readonly reason: unknown } | undefined;
+    }
+  | undefined => {
+  if (cause instanceof ArtifactFileCancelled)
+    return {
+      ...cause.fileCancellation.outcome,
+      cancellation: { reason: cause.fileCancellation.reason },
+    };
+  if (
+    cause instanceof ArtifactFileCleanupFailure &&
+    cause.fileCleanupFailure.outcome.kind === "completed"
+  )
+    return {
+      ...cause.fileCleanupFailure.outcome,
+      cancellation: cause.fileCleanupFailure.completionCancellation,
+    };
+  return undefined;
+};
+
 /** Bind a translated failure to its exact descriptor leases, including failed retries. */
 export const bindArtifactFileCleanup = (
   cause: unknown,
   error: AnalysisError,
 ): void => {
   const leases =
-    cause instanceof ArtifactFileCleanupFailure
-      ? cause.cleanupLeases
-      : cause instanceof ArtifactResourceRetryFailure
-        ? cause.cleanupLeases
-        : undefined;
+    cause instanceof ArtifactReaderFailure ? cause.cleanupLeases : undefined;
   if (leases !== undefined) new AnalysisCleanupLeaseGroup(error, leases);
 };
 
@@ -163,7 +226,11 @@ export const assertArtifactReadActive = (
 /** Admit a regular file without blocking on pipes, retaining failed admission closes. */
 export const withArtifactRegularFile = async <Value>(
   path: string,
-  resources: ArtifactResourceScope,
+  resources: {
+    retain(
+      owner: Extract<ArtifactResourceOwner, { readonly kind: "lease" }>,
+    ): void;
+  },
   signal: AbortSignal | undefined,
   operation: (file: FileHandle) => Promise<Value>,
   symlinks: "follow" | "reject" = "reject",
@@ -175,8 +242,9 @@ export const withArtifactRegularFile = async <Value>(
       path,
       {
         symlinks,
+        ...(signal === undefined ? {} : { signal }),
         retainFailedClose: (owner) => {
-          cleanupLease = new AnalysisCleanupLease(() => owner.close());
+          cleanupLease = new AnalysisCleanupLease(() => owner.close(), [path]);
           resources.retain({
             kind: "lease",
             resource: path,
@@ -189,23 +257,16 @@ export const withArtifactRegularFile = async <Value>(
         return await operation(file);
       },
     );
-    if (signal?.aborted)
-      throw new ArtifactFileCancelled({
-        reason: signal.reason,
-        outcome: { kind: "completed", value },
-      });
     return value;
   } catch (cause: unknown) {
     if (
       cause instanceof RegularFileCleanupFailure &&
       cleanupLease !== undefined
     )
-      throw new ArtifactFileCleanupFailure(
-        cause,
-        cleanupLease,
-        signal?.aborted ? { reason: signal.reason } : undefined,
-      );
-    throw cause;
+      throw new ArtifactFileCleanupFailure(cause, cleanupLease);
+    if (cause instanceof RegularFileCancelled)
+      throw new ArtifactFileCancelled(cause);
+    throw artifactOperationCause(cause);
   }
 };
 
@@ -218,7 +279,7 @@ export const withArtifactFileHandle = async <Value>(
   operation: (file: FileHandle) => Promise<Value>,
 ): Promise<Value> => {
   const owner = new OwnedFileHandle(file);
-  const cleanupLease = new AnalysisCleanupLease(() => owner.close());
+  const cleanupLease = new AnalysisCleanupLease(() => owner.close(), [path]);
   try {
     return await withOwnedFileHandle(
       path,
@@ -236,13 +297,18 @@ export const withArtifactFileHandle = async <Value>(
     );
   } catch (cause: unknown) {
     if (cause instanceof RegularFileCleanupFailure)
-      throw new ArtifactFileCleanupFailure(
-        cause,
-        cleanupLease,
-        signal?.aborted ? { reason: signal.reason } : undefined,
-      );
+      throw new ArtifactFileCleanupFailure(cause, cleanupLease);
     if (cause instanceof RegularFileCancelled)
       throw new ArtifactFileCancelled(cause);
-    throw cause;
+    throw artifactOperationCause(cause);
   }
 };
+
+const artifactOperationCause = (cause: unknown): unknown =>
+  cause instanceof RegularFileOperationCancelled
+    ? new ArtifactReaderFailure(
+        "cancelled",
+        "Artifact file operation cancelled",
+        { cause: cause.reason },
+      )
+    : cause;
